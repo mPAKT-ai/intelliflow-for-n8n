@@ -1,0 +1,66 @@
+{
+  "manifest_version": 3,
+  "name": "IntelliFlow for n8n",
+  "version": "1.0.0",
+  "description": "AI copilot for building advanced n8n workflows in IF-Lang, a dynamic language that adapts to your installed nodes. Powered by Gemini.",
+  "action": {
+    "default_title": "Toggle IntelliFlow",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://generativelanguage.googleapis.com/*",
+    "https://api.openai.com/*",
+    "https://api.anthropic.com/*",
+    "https://openrouter.ai/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+    "https://*/*",
+    "http://*/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["src/bridge/bridge.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": [
+        "src/core/protocol.js",
+        "src/lang/iflang.js",
+        "src/ai/providers.js",
+        "src/content/icons.js",
+        "src/content/ui.js",
+        "src/content/content.js"
+      ],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["src/bridge/bridge.js"],
+      "matches": ["http://*/*", "https://*/*"]
+    }
+  ]
+}
