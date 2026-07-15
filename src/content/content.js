@@ -23,7 +23,13 @@
     aborter: null,
   };
 
-  // ---- session manager (persisted, browsable) --------------------------
+  // ---- session manager + conversation tree ------------------------------
+  //
+  // A conversation is a TREE (like ChatGPT): editing a prompt or regenerating a
+  // reply creates a sibling branch instead of discarding the old one, so you can
+  // flip between versions and their downstream paths. The "active path" (root ->
+  // leaf, following each node's active child) is what the model sees and what we
+  // render. Nodes: { id, parent, role, content, hidden, children:[ids], active }.
 
   function genId() {
     return "s" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -33,15 +39,74 @@
       ? { scopeKey: "wf:" + (ctx.workflowId || ""), scopeLabel: ctx.name || "Workflow" }
       : { scopeKey: "list", scopeLabel: "Workflow list" };
   }
+  function ensureTree(s) {
+    if (s.nodes) return;
+    s.nodes = {};
+    s.rootChildren = [];
+    s.rootActive = 0;
+    s.leaf = null;
+    // Migrate an old flat `messages` array into a linear tree.
+    let parent = null;
+    for (const m of s.messages || []) {
+      const id = genId();
+      s.nodes[id] = { id, parent, role: m.role, content: m.content, hidden: !!m.hidden, children: [], active: 0 };
+      if (parent) { const p = s.nodes[parent]; p.children.push(id); p.active = p.children.length - 1; }
+      else { s.rootChildren.push(id); s.rootActive = s.rootChildren.length - 1; }
+      parent = id;
+    }
+    s.leaf = parent;
+    delete s.messages;
+  }
   function setActiveSession(s) {
+    ensureTree(s);
     store.session = s;
-    store.history = s.messages;
   }
   function newSession(ctx) {
     const { scopeKey, scopeLabel } = scopeInfo(ctx);
-    const s = { id: genId(), title: null, scopeKey, scopeLabel, createdAt: Date.now(), updatedAt: Date.now(), messages: [] };
+    const s = { id: genId(), title: null, scopeKey, scopeLabel, createdAt: Date.now(), updatedAt: Date.now(), nodes: {}, rootChildren: [], rootActive: 0, leaf: null };
     setActiveSession(s);
     return s;
+  }
+  function pathNodes(s) {
+    ensureTree(s);
+    const path = [];
+    const seen = new Set();
+    let list = s.rootChildren, idx = s.rootActive, id = list[idx];
+    while (id && s.nodes[id] && !seen.has(id)) {
+      seen.add(id);
+      const n = s.nodes[id];
+      path.push(n);
+      list = n.children;
+      idx = n.active;
+      id = list[idx];
+    }
+    return path;
+  }
+  function activeMessages(s) {
+    return pathNodes(s).map((n) => ({ role: n.role, content: n.content, hidden: n.hidden }));
+  }
+  function appendMessage(s, msg) {
+    ensureTree(s);
+    const id = genId();
+    const parent = s.leaf;
+    s.nodes[id] = { id, parent, role: msg.role, content: msg.content, hidden: !!msg.hidden, children: [], active: 0 };
+    if (parent) { const p = s.nodes[parent]; p.children.push(id); p.active = p.children.length - 1; }
+    else { s.rootChildren.push(id); s.rootActive = s.rootChildren.length - 1; }
+    s.leaf = id;
+    return id;
+  }
+  function siblingsOf(s, node) {
+    if (!node.parent) return { list: s.rootChildren, active: s.rootActive, setActive: (i) => (s.rootActive = i) };
+    const p = s.nodes[node.parent];
+    return { list: p.children, active: p.active, setActive: (i) => (p.active = i) };
+  }
+  function recomputeLeaf(s) {
+    const p = pathNodes(s);
+    s.leaf = p.length ? p[p.length - 1].id : null;
+  }
+  function hasMessages(s) {
+    ensureTree(s);
+    return s.rootChildren.length > 0;
   }
   function sessionForScope(ctx) {
     const { scopeKey } = scopeInfo(ctx);
@@ -52,15 +117,15 @@
         .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0] || null
     );
   }
-  function deriveTitle(messages) {
-    const u = messages.find((m) => m.role === "user");
+  function deriveTitle(s) {
+    const u = pathNodes(s).find((n) => n.role === "user" && !n.hidden);
     const t = u ? u.content.filter((c) => c.type === "text").map((c) => c.text).join(" ") : "";
     return (t || "New chat").trim().slice(0, 48);
   }
   function commitSession() {
     const s = store.session;
-    if (!s || !s.messages.length) return;
-    if (!s.title) s.title = deriveTitle(s.messages);
+    if (!s || !hasMessages(s)) return;
+    if (!s.title) s.title = deriveTitle(s);
     s.updatedAt = Date.now();
     IF.sessionStore.upsert(s);
     IF.sessionStore.setActive(s.id);
@@ -81,7 +146,7 @@
     refreshSessionsUI();
   }
   function startNewChat() {
-    if (store.session && !store.session.messages.length) return; // already fresh
+    if (store.session && !hasMessages(store.session)) return; // already fresh
     if (store.aborter) { store.aborter.abort(); store.aborter = null; IF.UI.setBusy(false); }
     commitSession();
     newSession(store.context);
@@ -116,9 +181,10 @@
       IF.UI.onNewChat(() => startNewChat());
       IF.UI.onSelectSession((id) => activateSession(id));
       IF.UI.onDeleteSession((id) => deleteSession(id));
-      IF.UI.onRegenerate((ord) => regenerateMessage(ord));
-      IF.UI.onEditMessage((ord) => editMessage(ord));
-      IF.UI.onDeleteMessage((ord) => deleteMessage(ord));
+      IF.UI.onRegenerate((nodeId) => regenerateMessage(nodeId));
+      IF.UI.onEditMessage((nodeId, newText) => editMessage(nodeId, newText));
+      IF.UI.onDeleteMessage((nodeId) => deleteMessage(nodeId));
+      IF.UI.onNavigate((nodeId, dir) => navigateVersion(nodeId, dir));
 
       // Establish the current context + active session up front.
       try {
@@ -170,18 +236,30 @@
     }
   }
 
+  function nodeText(n) {
+    return (n.content || []).filter((c) => c.type === "text").map((c) => c.text).filter(Boolean).join("");
+  }
+  // {idx,total} version info if this node has sibling versions.
+  function versionOf(s, n) {
+    const sib = siblingsOf(s, n);
+    return sib.list.length > 1 ? { idx: sib.active + 1, total: sib.list.length } : null;
+  }
   function renderSession(opts) {
     opts = opts || {};
+    const s = store.session;
     IF.UI.clearMessages(store.context);
-    IF.UI.renderTodos((store.session && store.session.todos) || []);
-    for (const turn of store.history) {
-      if (turn.hidden) continue;
-      const text = (turn.content || []).filter((c) => c.type === "text").map((c) => c.text).filter(Boolean).join("");
-      if (turn.role === "user" && text) IF.UI.addUser(text);
-      else if (turn.role === "assistant" && text) {
-        IF.UI.startAi();
-        IF.UI.appendAi(text);
-        IF.UI.endAi();
+    IF.UI.renderTodos((s && s.todos) || []);
+    if (s) {
+      for (const n of pathNodes(s)) {
+        if (n.hidden) continue;
+        if (n.role === "user") {
+          const text = nodeText(n);
+          if (text) IF.UI.addUser(text, { nodeId: n.id, version: versionOf(s, n) });
+        } else if (n.role === "assistant") {
+          const text = nodeText(n);
+          if (text) IF.UI.renderAi(text, { nodeId: n.id, version: versionOf(s, n) });
+          for (const c of n.content || []) if (c.type === "tool_call") IF.UI.addToolBadge(c.name, c.args);
+        }
       }
     }
     if (opts.announce) {
@@ -580,44 +658,53 @@
     const prov = IF.AI.PROVIDERS[providerKey];
     const cfg = IF.settings.providerConfig(providerKey);
     if (prov && prov.needsKey && !cfg.apiKey) {
-      IF.UI.addUser(text);
+      addUserTurn(text);
       IF.UI.notify(`Add an API key for **${prov.label}** in settings (the gear icon).`, "error");
+      commitSession();
       return;
     }
     if (prov && prov.curl && !cfg.curlTemplate) {
-      IF.UI.addUser(text);
+      addUserTurn(text);
       IF.UI.notify("Paste a cURL command in settings for the Custom (cURL) provider — use `{{PROMPT}}` where the message goes.", "error");
+      commitSession();
       return;
     }
-    IF.UI.addUser(text);
-    await runConversation(text);
+    addUserTurn(text);
+    await runConversation();
   }
 
-  // Runs the model over the current history. userText === null continues/
-  // regenerates without adding a new user turn (used by Regenerate).
-  async function runConversation(userText) {
+  function addUserTurn(text) {
+    appendMessage(store.session, { role: "user", content: [{ type: "text", text }] });
+    renderSession({});
+  }
+
+  // Runs the model over the current active path. New turns (assistant / tool /
+  // nudge) are reconciled back into the conversation tree when it finishes.
+  async function runConversation() {
     const providerKey = IF.settings.get("provider");
     const cfg = IF.settings.providerConfig(providerKey);
+    const s = store.session;
     IF.UI.setBusy(true, "Thinking…");
     store.stopped = false;
     store.aborter = new AbortController();
-    const boundSession = store.session;
     IF.log("send: provider=" + providerKey + " model=" + (cfg.model || "?") + " mode=" + IF.settings.get("permissionMode"));
 
     const ground = await grounding();
-    if (store.session !== boundSession) {
-      IF.UI.setBusy(false);
-      store.aborter = null;
-      return;
-    }
+    if (store.session !== s) { IF.UI.setBusy(false); store.aborter = null; return; }
+
+    const full = activeMessages(s);
+    const MAX = 40; // cap what the model sees; the tree keeps everything
+    store.history = full.length > MAX ? full.slice(-MAX) : full.slice();
+    const preLen = store.history.length;
 
     let toolTimer = null;
+    let errored = false;
     try {
       await IF.AI.chat({
         providerKey,
         config: cfg,
         history: store.history,
-        userParts: userText != null ? [{ type: "text", text: userText }] : null,
+        userParts: null,
         langSpec: IF.Lang.spec(),
         extraContext: modeContext() + "\n\n" + ground,
         tools: toolsForContext(store.context),
@@ -634,63 +721,92 @@
       IF.UI.endAi();
       if (e.name === "AbortError" || store.stopped) {
         /* stop already reported by stopRun */
-      } else IF.UI.notify("Something went wrong: " + e.message, "error");
+      } else { errored = true; IF.UI.notify("Something went wrong: " + e.message, "error"); }
     } finally {
       IF.UI.setBusy(false);
       store.aborter = null;
-      trimHistory();
+      for (let i = preLen; i < store.history.length; i++) appendMessage(s, store.history[i]);
+      // Re-render to attach node ids / version nav / actions on success. On
+      // error or stop, keep the live bubbles + the notice instead of wiping it.
+      if (!errored && !store.stopped) renderSession({});
       commitSession();
     }
   }
 
-  // ---- message actions (regenerate / edit / delete) --------------------
+  // ---- message actions (versioned conversation tree) -------------------
 
-  function nthTextTurn(role, ord) {
-    let n = 0;
-    for (let i = 0; i < store.history.length; i++) {
-      const t = store.history[i];
-      if (t.hidden || t.role !== role) continue;
-      const has = (t.content || []).some((c) => c.type === "text" && c.text && c.text.trim());
-      if (!has) continue;
-      if (n === ord) return i;
-      n++;
-    }
-    return -1;
-  }
-  function turnText(t) {
-    return (t.content || []).filter((c) => c.type === "text").map((c) => c.text).join("");
-  }
-
-  function regenerateMessage(aiOrd) {
+  function regenerateMessage(nodeId) {
     if (store.aborter) return;
-    const idx = nthTextTurn("assistant", aiOrd);
-    if (idx < 0) return;
-    // Drop everything from the user turn that prompted this response onward, then re-run.
-    let u = -1;
-    for (let i = idx - 1; i >= 0; i--) {
-      if (store.history[i].role === "user" && !store.history[i].hidden) { u = i; break; }
-    }
-    if (u < 0) return;
-    store.history.length = u + 1;
+    const s = store.session;
+    const path = pathNodes(s);
+    const i = path.findIndex((n) => n.id === nodeId);
+    if (i < 0) return;
+    let u = null;
+    for (let j = i - 1; j >= 0; j--) if (path[j].role === "user" && !path[j].hidden) { u = path[j]; break; }
+    if (!u) return;
+    u.active = u.children.length; // end the active path at the prompt; the run branches a new reply
+    recomputeLeaf(s);
     renderSession({});
-    runConversation(null);
+    runConversation();
   }
 
-  function editMessage(userOrd) {
+  function editMessage(nodeId, newText) {
     if (store.aborter) return;
-    const idx = nthTextTurn("user", userOrd);
-    if (idx < 0) return;
-    const text = turnText(store.history[idx]);
-    store.history.length = idx; // remove this message and everything after
+    const s = store.session;
+    const n = s.nodes[nodeId];
+    if (!n || n.role !== "user") return;
+    if (!newText || !newText.trim()) return;
+    if (n.parent) s.nodes[n.parent].active = s.nodes[n.parent].children.length;
+    else s.rootActive = s.rootChildren.length;
+    recomputeLeaf(s); // active path now ends just before the old prompt
+    appendMessage(s, { role: "user", content: [{ type: "text", text: newText }] }); // new sibling version
     renderSession({});
-    IF.UI.setInput(text);
+    runConversation();
+  }
+
+  function navigateVersion(nodeId, dir) {
+    if (store.aborter) return;
+    const s = store.session;
+    const n = s.nodes[nodeId];
+    if (!n) return;
+    const sib = siblingsOf(s, n);
+    const ni = Math.max(0, Math.min(sib.list.length - 1, sib.active + dir));
+    if (ni === sib.active) return;
+    sib.setActive(ni);
+    recomputeLeaf(s);
+    renderSession({});
     commitSession();
   }
 
-  function deleteMessage(aiOrd) {
-    const idx = nthTextTurn("assistant", aiOrd);
+  async function deleteMessage(nodeId) {
+    if (store.aborter) return;
+    const s = store.session;
+    const n = s.nodes[nodeId];
+    if (!n) return;
+    const ok = await IF.UI.confirm({
+      title: "Delete this prompt?",
+      body: "This deletes the prompt and every message after it. This can't be undone.",
+      confirm: "Delete",
+    });
+    if (!ok) return;
+    const sib = siblingsOf(s, n);
+    const idx = sib.list.indexOf(nodeId);
     if (idx < 0) return;
-    store.history.splice(idx, 1);
+    // Remove the node and its entire subtree (everything after it).
+    const stack = [nodeId];
+    while (stack.length) {
+      const id = stack.pop();
+      const nn = s.nodes[id];
+      if (!nn) continue;
+      stack.push(...nn.children);
+      delete s.nodes[id];
+    }
+    sib.list.splice(idx, 1);
+    const parent = n.parent ? s.nodes[n.parent] : null;
+    const na = sib.list.length ? Math.min(idx, sib.list.length - 1) : 0;
+    if (parent) parent.active = na;
+    else s.rootActive = na;
+    recomputeLeaf(s);
     renderSession({});
     commitSession();
   }
@@ -709,11 +825,6 @@
         search_workflows: "Searching workflows…",
       }[name] || "Working…"
     );
-  }
-
-  function trimHistory() {
-    const MAX = 40;
-    if (store.history.length > MAX) store.history.splice(0, store.history.length - MAX);
   }
 
   IF.bridge.on("context-changed", (ctx) => {

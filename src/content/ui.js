@@ -104,12 +104,18 @@
 .if-row:hover .if-actions, .if-actions.menu-open { opacity:1; }
 .if-actbtn { width:26px; height:24px; border:0; border-radius:6px; background:transparent; color:var(--muted); cursor:pointer; display:flex; align-items:center; justify-content:center; }
 .if-actbtn:hover { background:var(--surface2); color:var(--text); }
-.if-moremenu { display:none; position:absolute; bottom:100%; right:0; margin-bottom:4px; background:var(--surface); border:1px solid var(--line2);
-  border-radius:8px; box-shadow:0 6px 20px rgba(0,0,0,.4); z-index:10; padding:4px; min-width:118px; }
-.if-actions.menu-open .if-moremenu { display:block; }
-.if-moremenu button { display:flex; align-items:center; gap:8px; width:100%; padding:7px 10px; border:0; border-radius:6px; background:transparent;
-  color:var(--danger); cursor:pointer; font-size:12px; font-family:inherit; text-align:left; }
-.if-moremenu button:hover { background:var(--surface2); }
+.if-vernav { display:flex; align-items:center; gap:1px; font-size:10.5px; color:var(--muted); font-family:var(--mono); }
+.if-vernav span { min-width:26px; text-align:center; }
+.if-vernav .if-actbtn { width:20px; height:22px; }
+.if-editbox { display:flex; flex-direction:column; gap:6px; width:100%; }
+.if-edit-area { width:100%; min-height:60px; max-height:220px; resize:vertical; padding:9px 11px; font-size:13px; line-height:1.45;
+  background:var(--surface2); color:var(--text); border:1px solid var(--accent); border-radius:9px; outline:none; }
+.if-edit-btns { display:flex; justify-content:flex-end; gap:8px; }
+.if-edit-btns button { padding:6px 12px; border-radius:7px; font-size:12px; font-weight:600; cursor:pointer; border:1px solid var(--line2); }
+.if-edit-cancel { background:transparent; color:var(--muted); }
+.if-edit-send { background:var(--accent); color:#fff; border-color:transparent; }
+.if-btn.if-btn-danger { background:var(--danger); color:#1a0808; border-color:transparent; }
+.if-btn.if-btn-danger:hover { filter:brightness(1.08); }
 .if-msg.ai .if-ai-head { display:flex; align-items:center; gap:6px; font-size:10px; font-weight:700; color:var(--muted);
   margin-bottom:5px; text-transform:uppercase; letter-spacing:.7px; font-family:var(--mono); }
 .if-msg.ai .if-ai-head .if-logo { color:var(--accent); }
@@ -444,30 +450,26 @@
         if (!e.target.closest(".if-sessions-menu") && !e.target.closest(".if-sessions-btn")) {
           this.el.sessionsMenu.classList.remove("open");
         }
-        if (!e.target.closest(".act-more") && !e.target.closest(".if-moremenu")) {
-          this.el.messages.querySelectorAll(".if-actions.menu-open").forEach((a) => a.classList.remove("menu-open"));
-        }
       });
 
-      // Message hover actions (delegated).
+      // Message actions (delegated, keyed by the row's node id).
       this.el.messages.addEventListener("click", (e) => {
-        const wrapAi = e.target.closest(".if-row-ai");
-        const wrapUser = e.target.closest(".if-row-user");
+        const row = e.target.closest(".if-row");
+        if (!row) return;
+        const nodeId = row.dataset.node;
         if (e.target.closest(".act-copy")) {
-          const w = wrapAi || wrapUser;
-          if (w) { this.copyText(w._raw || ""); this.flash(e.target.closest(".act-copy")); }
+          this.copyText(row._raw || "");
+          this.flash(e.target.closest(".act-copy"));
         } else if (e.target.closest(".act-regen")) {
-          if (wrapAi && this.regenCb) this.regenCb(this.aiOrdinal(wrapAi));
+          if (nodeId && this.regenCb) this.regenCb(nodeId);
         } else if (e.target.closest(".act-edit")) {
-          if (wrapUser && this.editCb) this.editCb(this.userOrdinal(wrapUser));
-        } else if (e.target.closest(".act-more")) {
-          e.stopPropagation();
-          const row = e.target.closest(".if-actions");
-          const open = row.classList.contains("menu-open");
-          this.el.messages.querySelectorAll(".if-actions.menu-open").forEach((a) => a.classList.remove("menu-open"));
-          if (!open) row.classList.add("menu-open");
-        } else if (e.target.closest(".mm-del")) {
-          if (wrapAi && this.deleteMsgCb) this.deleteMsgCb(this.aiOrdinal(wrapAi));
+          this.beginInlineEdit(row);
+        } else if (e.target.closest(".act-del")) {
+          if (nodeId && this.deleteMsgCb) this.deleteMsgCb(nodeId);
+        } else if (e.target.closest(".ver-prev")) {
+          if (nodeId && this.navCb) this.navCb(nodeId, -1);
+        } else if (e.target.closest(".ver-next")) {
+          if (nodeId && this.navCb) this.navCb(nodeId, 1);
         }
       });
 
@@ -558,13 +560,35 @@
     onRegenerate(cb) { this.regenCb = cb; }
     onEditMessage(cb) { this.editCb = cb; }
     onDeleteMessage(cb) { this.deleteMsgCb = cb; }
+    onNavigate(cb) { this.navCb = cb; }
 
-    aiOrdinal(wrap) {
-      return Array.from(this.el.messages.querySelectorAll(".if-row-ai")).indexOf(wrap);
+    // Promise-based confirm dialog (reuses the approval overlay).
+    confirm({ title, body, confirm }) {
+      this.cancelApprovals();
+      return new Promise((resolve) => {
+        const host = this.el.approvalHost;
+        host.innerHTML =
+          `<div class="if-card"><div class="if-card-head">${icon("trash", 14)} ${escapeHtml(title || "Are you sure?")}</div>` +
+          `<div class="if-card-sum">${escapeHtml(body || "")}</div>` +
+          `<div class="if-card-actions"><div class="if-card-btns">` +
+          `<button class="if-btn reject cf-cancel">Cancel</button>` +
+          `<button class="if-btn cf-ok if-btn-danger">${escapeHtml(confirm || "Confirm")}</button></div></div></div>`;
+        host.classList.add("active");
+        let done = false;
+        const finish = (v) => {
+          if (done) return;
+          done = true;
+          this._pendingApproval = null;
+          host.classList.remove("active");
+          host.innerHTML = "";
+          resolve(v);
+        };
+        this._pendingApproval = () => finish(false);
+        host.querySelector(".cf-ok").addEventListener("click", () => finish(true));
+        host.querySelector(".cf-cancel").addEventListener("click", () => finish(false));
+      });
     }
-    userOrdinal(wrap) {
-      return Array.from(this.el.messages.querySelectorAll(".if-row-user")).indexOf(wrap);
-    }
+
     copyText(t) {
       try {
         navigator.clipboard.writeText(t || "");
@@ -734,39 +758,64 @@
     }
     scroll() { this.el.messages.scrollTop = this.el.messages.scrollHeight; }
 
-    addUser(text) {
+    // Version navigator + action buttons for a message row.
+    actionsHTML(kind, version) {
+      const nav =
+        version && version.total > 1
+          ? `<div class="if-vernav"><button class="if-actbtn ver-prev" title="Previous version">${icon("chevronLeft", 13)}</button>` +
+            `<span>${version.idx}/${version.total}</span>` +
+            `<button class="if-actbtn ver-next" title="Next version">${icon("chevronRight", 13)}</button></div>`
+          : "";
+      if (kind === "user")
+        return (
+          `<div class="if-actions">${nav}` +
+          `<button class="if-actbtn act-edit" title="Edit">${icon("edit", 13)}</button>` +
+          `<button class="if-actbtn act-copy" title="Copy">${icon("copy", 13)}</button>` +
+          `<button class="if-actbtn act-del" title="Delete prompt and everything after">${icon("trash", 13)}</button></div>`
+        );
+      return (
+        `<div class="if-actions">${nav}` +
+        `<button class="if-actbtn act-copy" title="Copy">${icon("copy", 13)}</button>` +
+        `<button class="if-actbtn act-regen" title="Regenerate">${icon("refresh", 13)}</button></div>`
+      );
+    }
+
+    addUser(text, opts) {
+      opts = opts || {};
       this.clearEmpty();
       const wrap = document.createElement("div");
       wrap.className = "if-row if-row-user";
-      const d = document.createElement("div");
-      d.className = "if-msg user";
-      d.textContent = text;
-      wrap.appendChild(d);
+      if (opts.nodeId) wrap.dataset.node = opts.nodeId;
       wrap._raw = text;
-      wrap.appendChild(this.userActions());
+      wrap._version = opts.version || null;
+      this.buildUserRow(wrap);
+      this.el.messages.appendChild(wrap);
+      this.scroll();
+    }
+    buildUserRow(wrap) {
+      wrap.innerHTML = `<div class="if-msg user"></div>` + this.actionsHTML("user", wrap._version);
+      wrap.querySelector(".if-msg.user").textContent = wrap._raw;
+    }
+
+    // Finalised (post-run / restored) AI message with actions + version nav.
+    renderAi(text, opts) {
+      opts = opts || {};
+      this.clearEmpty();
+      const wrap = document.createElement("div");
+      wrap.className = "if-row if-row-ai";
+      if (opts.nodeId) wrap.dataset.node = opts.nodeId;
+      wrap._raw = text;
+      wrap._version = opts.version || null;
+      wrap.innerHTML =
+        `<div class="if-msg ai if-genai"><div class="if-ai-head"><span class="if-logo">${icon("sparkles", 12)}</span>IntelliFlow</div>` +
+        `<div class="if-ai-body">${renderMarkdown(text)}</div></div>` +
+        this.actionsHTML("ai", wrap._version);
       this.el.messages.appendChild(wrap);
       this.scroll();
     }
 
-    userActions() {
-      const row = document.createElement("div");
-      row.className = "if-actions";
-      row.innerHTML =
-        `<button class="if-actbtn act-edit" title="Edit">${icon("edit", 13)}</button>` +
-        `<button class="if-actbtn act-copy" title="Copy">${icon("copy", 13)}</button>`;
-      return row;
-    }
-    aiActions() {
-      const row = document.createElement("div");
-      row.className = "if-actions";
-      row.innerHTML =
-        `<button class="if-actbtn act-copy" title="Copy">${icon("copy", 13)}</button>` +
-        `<button class="if-actbtn act-regen" title="Regenerate">${icon("refresh", 13)}</button>` +
-        `<button class="if-actbtn act-more" title="More">${icon("more", 13)}</button>` +
-        `<div class="if-moremenu"><button class="mm-del">${icon("trash", 13)}<span>Delete</span></button></div>`;
-      return row;
-    }
-
+    // Live streaming bubble (no actions/nav; replaced by renderAi when the run
+    // finishes and reconciles into the tree).
     startAi() {
       this.clearEmpty();
       const wrap = document.createElement("div");
@@ -789,23 +838,38 @@
       this.scroll();
     }
     endAi() {
-      if (this._aiWrap) {
-        if (!this._aiRaw.trim()) {
-          this._aiWrap.remove(); // turn was only tool calls / empty
-        } else {
-          this._aiWrap._raw = this._aiRaw;
-          this._aiWrap.appendChild(this.aiActions());
-        }
-      }
+      if (this._aiWrap && !this._aiRaw.trim()) this._aiWrap.remove();
       this._aiWrap = null;
       this._aiBody = null;
       this._aiRaw = "";
     }
 
-    setInput(text) {
-      this.el.input.value = text;
-      this.autoGrow();
-      this.el.input.focus();
+    // Inline prompt editing (branches a new version on save).
+    beginInlineEdit(wrap) {
+      if (wrap._editing) return;
+      wrap._editing = true;
+      const nodeId = wrap.dataset.node;
+      const orig = wrap._raw || "";
+      wrap.innerHTML =
+        `<div class="if-editbox"><textarea class="if-edit-area"></textarea>` +
+        `<div class="if-edit-btns"><button class="if-edit-cancel">Cancel</button>` +
+        `<button class="if-edit-send">Save &amp; send</button></div></div>`;
+      const ta = wrap.querySelector(".if-edit-area");
+      ta.value = orig;
+      ta.style.height = "auto";
+      ta.style.height = Math.min(180, ta.scrollHeight) + "px";
+      ta.focus();
+      const cancel = () => { wrap._editing = false; this.buildUserRow(wrap); };
+      wrap.querySelector(".if-edit-cancel").addEventListener("click", cancel);
+      wrap.querySelector(".if-edit-send").addEventListener("click", () => {
+        const v = ta.value.trim();
+        if (v && this.editCb) this.editCb(nodeId, v);
+        else cancel();
+      });
+      ta.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") { e.preventDefault(); cancel(); }
+        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); wrap.querySelector(".if-edit-send").click(); }
+      });
     }
 
     addToolBadge(name, args) {
